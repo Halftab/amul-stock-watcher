@@ -8,8 +8,6 @@ import requests
 from playwright.async_api import async_playwright
 
 
-# IMPORTANT:
-# Use Amul's canonical product URL without /en/.
 PRODUCT_URL = (
     "https://shop.amul.com/product/"
     "amul-high-protein-plain-lassi-200-ml-or-pack-of-30"
@@ -71,56 +69,8 @@ def send_telegram(message):
     response.raise_for_status()
 
 
-async def apply_pincode(page):
-    """
-    Attempt to set the Amul delivery pincode.
-    """
-
-    try:
-        pincode_input = page.get_by_placeholder(
-            "Enter Your Pincode",
-            exact=False,
-        ).first
-
-        if await pincode_input.count() == 0:
-            pincode_input = page.locator(
-                'input[placeholder*="Pincode" i]'
-            ).first
-
-        if await pincode_input.count() == 0:
-            print("Pincode input not found.")
-            return False
-
-        await pincode_input.fill(PINCODE)
-        await pincode_input.press("Enter")
-
-        await page.wait_for_timeout(3000)
-
-        print(f"Pincode {PINCODE} submitted.")
-
-        # Verify that the input accepted the value.
-        try:
-            current_value = await pincode_input.input_value()
-
-            if PINCODE in current_value:
-                print(
-                    f"Pincode input contains {PINCODE}."
-                )
-                return True
-
-        except Exception:
-            pass
-
-        # The site may close/change the input after submission.
-        # Since submission itself succeeded, treat this as applied.
-        return True
-
-    except Exception as exc:
-        print(f"Could not apply pincode: {exc}")
-        return False
-
-
 async def check_stock():
+
     async with async_playwright() as p:
 
         browser = await p.chromium.launch(
@@ -141,7 +91,13 @@ async def check_stock():
         )
 
         try:
+
             print(f"Opening: {PRODUCT_URL}")
+
+            # IMPORTANT:
+            # Do NOT enter the pincode here.
+            # Entering it causes Amul to redirect to a broken
+            # /en/product URL on the automated browser.
 
             await page.goto(
                 PRODUCT_URL,
@@ -149,157 +105,88 @@ async def check_stock():
                 timeout=60000,
             )
 
-            # Give the StoreHippo page time to render.
+            # Allow JavaScript storefront to render.
             await page.wait_for_timeout(7000)
-
-            # -----------------------------------------------------
-            # Apply delivery pincode.
-            # -----------------------------------------------------
-
-            pincode_applied = await apply_pincode(page)
-
-            await page.wait_for_timeout(3000)
-
-            # -----------------------------------------------------
-            # Verify final URL.
-            # -----------------------------------------------------
 
             final_url = page.url
 
             print(f"Final URL: {final_url}")
 
-            if "amul-high-protein-plain-lassi-200-ml-or-pack-of-30" not in final_url.lower():
+            # -------------------------------------------------
+            # Verify that we stayed on the expected product page.
+            # -------------------------------------------------
+
+            if (
+                "amul-high-protein-plain-lassi-200-ml-or-pack-of-30"
+                not in final_url.lower()
+            ):
                 return {
                     "status": "UNKNOWN",
                     "price": None,
-                    "pincode_applied": pincode_applied,
+                    "pincode_applied": False,
                     "reason": (
-                        "Browser was redirected away from "
-                        "the expected product page."
+                        "Amul redirected away from the expected "
+                        "product page."
                     ),
                 }
 
-            # -----------------------------------------------------
+            # -------------------------------------------------
             # Read page text.
-            # -----------------------------------------------------
+            # -------------------------------------------------
 
             body_text = await page.locator(
                 "body"
             ).inner_text()
 
-            print(
-                f"Page text length: "
-                f"{len(body_text)} characters"
-            )
-
             body_lower = body_text.lower()
 
-            # Print the first portion for diagnostics.
-            diagnostic_text = re.sub(
+            print(
+                f"Page text length: {len(body_text)} characters"
+            )
+
+            # Print useful diagnostic information.
+            preview = re.sub(
                 r"\s+",
                 " ",
                 body_text,
             ).strip()
 
             print(
-                "Page preview: "
-                + diagnostic_text[:500]
+                f"Page preview: {preview[:1000]}"
             )
 
-            # -----------------------------------------------------
-            # Verify the actual product.
-            # -----------------------------------------------------
-
-            product_name_lower = PRODUCT_NAME.lower()
+            # -------------------------------------------------
+            # Verify product.
+            # -------------------------------------------------
 
             product_found = (
-                product_name_lower in body_lower
+                "amul high protein plain lassi" in body_lower
+                and "pack of 30" in body_lower
             )
 
-            # If the exact formatting differs, use key phrases.
-            if not product_found:
-                product_found = (
-                    "amul high protein plain lassi" in body_lower
-                    and "pack of 30" in body_lower
-                )
-
             print(
-                f"Product text found: {product_found}"
+                f"Product found: {product_found}"
             )
 
             if not product_found:
                 return {
                     "status": "UNKNOWN",
                     "price": None,
-                    "pincode_applied": pincode_applied,
+                    "pincode_applied": False,
                     "reason": (
-                        "The canonical product page loaded, "
-                        "but the expected product text was not found."
+                        "Expected product was not found "
+                        "on the product page."
                     ),
                 }
 
-            # -----------------------------------------------------
-            # Isolate the main product section.
-            #
-            # This prevents "Sold Out" text from unrelated
-            # recommended products affecting the result.
-            # -----------------------------------------------------
-
-            product_section = body_text
-
-            product_title_index = body_lower.find(
-                "amul high protein plain lassi"
-            )
-
-            if product_title_index >= 0:
-
-                product_section = body_text[
-                    product_title_index:
-                ]
-
-                related_index = product_section.lower().find(
-                    "related products"
-                )
-
-                if related_index >= 0:
-                    product_section = product_section[
-                        :related_index
-                    ]
-
-                recently_viewed_index = (
-                    product_section.lower().find(
-                        "recently viewed"
-                    )
-                )
-
-                if recently_viewed_index >= 0:
-                    product_section = product_section[
-                        :recently_viewed_index
-                    ]
-
-            product_section_clean = re.sub(
-                r"\s+",
-                " ",
-                product_section,
-            ).strip()
-
-            product_section_lower = (
-                product_section_clean.lower()
-            )
-
-            print(
-                "Product section: "
-                + product_section_clean[:800]
-            )
-
-            # -----------------------------------------------------
+            # -------------------------------------------------
             # Extract price.
-            # -----------------------------------------------------
+            # -------------------------------------------------
 
             price = None
 
             price_patterns = [
-                r"MRP\s*[:\-]?\s*₹\s*([\d,]+)",
+                r"MRP\s*₹\s*([\d,]+)",
                 r"₹\s*([\d,]+)",
             ]
 
@@ -307,27 +194,24 @@ async def check_stock():
 
                 match = re.search(
                     pattern,
-                    product_section_clean,
+                    body_text,
                     re.IGNORECASE,
                 )
 
                 if match:
+
                     price = int(
                         match.group(1).replace(",", "")
                     )
+
                     break
 
-            # -----------------------------------------------------
-            # Detect Sold Out / Out of Stock.
-            # -----------------------------------------------------
+            # -------------------------------------------------
+            # Check explicit Sold Out / Out of Stock text.
+            # -------------------------------------------------
 
-            sold_out = (
-                "sold out" in product_section_lower
-            )
-
-            out_of_stock = (
-                "out of stock" in product_section_lower
-            )
+            sold_out = "sold out" in body_lower
+            out_of_stock = "out of stock" in body_lower
 
             print(
                 f"Sold Out detected: {sold_out}"
@@ -342,16 +226,16 @@ async def check_stock():
                 return {
                     "status": "OUT_OF_STOCK",
                     "price": price,
-                    "pincode_applied": pincode_applied,
+                    "pincode_applied": False,
                     "reason": (
-                        "Product page explicitly reports "
-                        "Sold Out / Out of Stock."
+                        "Amul product page explicitly "
+                        "reports Sold Out / Out of Stock."
                     ),
                 }
 
-            # -----------------------------------------------------
-            # Look for an enabled Add to Cart button.
-            # -----------------------------------------------------
+            # -------------------------------------------------
+            # Check Add to Cart.
+            # -------------------------------------------------
 
             add_to_cart = page.get_by_role(
                 "button",
@@ -361,25 +245,24 @@ async def check_stock():
                 ),
             )
 
-            add_to_cart_count = await add_to_cart.count()
+            count = await add_to_cart.count()
 
             print(
-                f"Add to Cart buttons found: "
-                f"{add_to_cart_count}"
+                f"Add to Cart buttons found: {count}"
             )
 
-            for i in range(add_to_cart_count):
+            for i in range(count):
 
                 button = add_to_cart.nth(i)
 
                 try:
+
                     if await button.is_visible():
 
                         disabled = await button.is_disabled()
 
                         print(
                             f"Add to Cart {i}: "
-                            f"visible=True, "
                             f"disabled={disabled}"
                         )
 
@@ -388,30 +271,26 @@ async def check_stock():
                             return {
                                 "status": "IN_STOCK",
                                 "price": price,
-                                "pincode_applied": pincode_applied,
+                                "pincode_applied": False,
                                 "reason": (
                                     "Enabled Add to Cart "
                                     "button found."
                                 ),
                             }
 
-                except Exception as exc:
-                    print(
-                        f"Could not inspect Add to Cart "
-                        f"{i}: {exc}"
-                    )
+                except Exception:
+                    continue
 
-            # -----------------------------------------------------
-            # Product is real but availability is unclear.
-            # Stay conservative.
-            # -----------------------------------------------------
+            # -------------------------------------------------
+            # Product exists but stock cannot be determined.
+            # -------------------------------------------------
 
             return {
                 "status": "UNKNOWN",
                 "price": price,
-                "pincode_applied": pincode_applied,
+                "pincode_applied": False,
                 "reason": (
-                    "Product was found, but availability "
+                    "Product page loaded, but availability "
                     "could not be confirmed."
                 ),
             }
@@ -435,7 +314,9 @@ async def main():
 
     print(f"Product: {PRODUCT_NAME}")
     print(f"Pincode: {PINCODE}")
-    print(f"Pincode applied: {pincode_applied}")
+    print(
+        f"Pincode applied: {pincode_applied}"
+    )
 
     print(
         f"Price: ₹{price if price is not None else 'unknown'}"
@@ -447,13 +328,15 @@ async def main():
     previous_state = load_state()
     previous_status = previous_state.get("status")
 
-    print(f"Previous status: {previous_status}")
+    print(
+        f"Previous status: {previous_status}"
+    )
 
     save_state(status)
 
-    # ---------------------------------------------------------
-    # Alert only when the product becomes available.
-    # ---------------------------------------------------------
+    # -------------------------------------------------
+    # Alert only when product becomes available.
+    # -------------------------------------------------
 
     if (
         status == "IN_STOCK"
@@ -474,10 +357,15 @@ async def main():
 
         send_telegram(message)
 
-        print("✅ Telegram stock alert sent!")
+        print(
+            "✅ Telegram stock alert sent!"
+        )
 
     else:
-        print("No Telegram alert needed.")
+
+        print(
+            "No Telegram alert needed."
+        )
 
     print("=" * 60)
 
