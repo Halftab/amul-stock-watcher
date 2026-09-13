@@ -14,10 +14,6 @@ PRODUCT_URL = (
 )
 
 PRODUCT_NAME = "Amul High Protein Plain Lassi, 200 mL | Pack of 30"
-PRODUCT_KEYWORDS = [
-    "amul high protein plain lassi",
-    "pack of 30",
-]
 
 PINCODE = "110044"
 STATE_FILE = "state.json"
@@ -76,20 +72,15 @@ def send_telegram(message):
 async def apply_pincode(page):
     """
     Attempt to set the Amul delivery pincode.
-
-    Amul currently exposes an input labelled/placeholdered
-    "Enter Your Pincode".
     """
 
     try:
-        # First try a placeholder-based locator.
         pincode_input = page.get_by_placeholder(
             "Enter Your Pincode",
             exact=False,
         ).first
 
         if await pincode_input.count() == 0:
-            # Fallback: search inputs by their surrounding text/attributes.
             pincode_input = page.locator(
                 'input[placeholder*="Pincode" i]'
             ).first
@@ -101,7 +92,6 @@ async def apply_pincode(page):
         await pincode_input.fill(PINCODE)
         await pincode_input.press("Enter")
 
-        # Allow the site time to process the pincode.
         await page.wait_for_timeout(3000)
 
         print(f"Pincode {PINCODE} submitted.")
@@ -110,6 +100,45 @@ async def apply_pincode(page):
     except Exception as exc:
         print(f"Could not apply pincode: {exc}")
         return False
+
+
+async def get_product_heading(page):
+    """
+    Find the actual product H1 heading.
+    """
+
+    try:
+        headings = page.locator("h1")
+
+        count = await headings.count()
+
+        print(f"H1 headings found: {count}")
+
+        for i in range(count):
+            try:
+                text = await headings.nth(i).inner_text()
+
+                cleaned = re.sub(
+                    r"\s+",
+                    " ",
+                    text.replace("\xa0", " "),
+                ).strip()
+
+                print(f"H1[{i}]: {cleaned}")
+
+                if (
+                    "amul high protein plain lassi" in cleaned.lower()
+                    and "pack of 30" in cleaned.lower()
+                ):
+                    return cleaned
+
+            except Exception:
+                continue
+
+    except Exception as exc:
+        print(f"Could not inspect H1 headings: {exc}")
+
+    return None
 
 
 async def check_stock():
@@ -133,154 +162,275 @@ async def check_stock():
 
         print(f"Opening: {PRODUCT_URL}")
 
-        await page.goto(
-            PRODUCT_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        try:
+            await page.goto(
+                PRODUCT_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
 
-        # Let the JavaScript storefront finish rendering.
-        await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(5000)
 
-        # Try to set the delivery pincode.
-        pincode_applied = await apply_pincode(page)
+            # -----------------------------------------------------
+            # Apply delivery pincode.
+            # -----------------------------------------------------
 
-        # Give the page another moment after the pincode operation.
-        await page.wait_for_timeout(2000)
+            pincode_applied = await apply_pincode(page)
 
-        body_text = await page.locator("body").inner_text()
+            await page.wait_for_timeout(2000)
 
-        body_lower = body_text.lower()
+            # -----------------------------------------------------
+            # Get page text.
+            # -----------------------------------------------------
 
-        # ---------------------------------------------------------
-        # Verify the product using multiple signals.
-        # ---------------------------------------------------------
+            body_text = await page.locator("body").inner_text()
 
-        product_name_found = (
-            "amul high protein plain lassi" in body_lower
-        )
+            # -----------------------------------------------------
+            # Verify product using the actual H1 heading.
+            # -----------------------------------------------------
 
-        pack_size_found = "pack of 30" in body_lower
+            product_heading = await get_product_heading(page)
 
-        product_verified = (
-            product_name_found and pack_size_found
-        )
+            product_verified = product_heading is not None
 
-        if not product_verified:
-            await browser.close()
+            print(
+                f"Product heading found: {product_verified}"
+            )
+
+            if product_heading:
+                print(
+                    f"Product heading: {product_heading}"
+                )
+
+            if not product_verified:
+                return {
+                    "status": "UNKNOWN",
+                    "price": None,
+                    "pincode_applied": pincode_applied,
+                    "reason": (
+                        "Product identity could not be reliably "
+                        "confirmed from the product heading."
+                    ),
+                }
+
+            # -----------------------------------------------------
+            # Extract price.
+            # -----------------------------------------------------
+
+            price = None
+
+            # First try the product area / page text.
+            price_patterns = [
+                r"MRP\s*[:\-]?\s*₹\s*([\d,]+)",
+                r"₹\s*([\d,]+)",
+            ]
+
+            for pattern in price_patterns:
+                match = re.search(
+                    pattern,
+                    body_text,
+                    re.IGNORECASE,
+                )
+
+                if match:
+                    price = int(
+                        match.group(1).replace(",", "")
+                    )
+                    break
+
+            # -----------------------------------------------------
+            # Find the product's main container.
+            #
+            # We deliberately avoid searching the entire page for
+            # "Sold Out", because Amul may display other products
+            # lower down that are also sold out.
+            # -----------------------------------------------------
+
+            product_text = ""
+
+            try:
+                h1_locator = page.locator("h1").filter(
+                    has_text=re.compile(
+                        r"amul\s+high\s+protein\s+plain\s+lassi",
+                        re.IGNORECASE,
+                    )
+                ).first
+
+                if await h1_locator.count() > 0:
+
+                    # Walk upward through parents and look for a
+                    # reasonably-sized product section.
+                    product_text = await h1_locator.evaluate(
+                        """
+                        (el) => {
+                            let current = el;
+
+                            for (let i = 0; i < 8; i++) {
+                                if (!current) break;
+
+                                const text =
+                                    current.innerText || "";
+
+                                const lower =
+                                    text.toLowerCase();
+
+                                if (
+                                    text.length < 12000 &&
+                                    (
+                                        lower.includes("mrp") ||
+                                        lower.includes("sold out") ||
+                                        lower.includes("out of stock") ||
+                                        lower.includes("add to cart")
+                                    )
+                                ) {
+                                    return text;
+                                }
+
+                                current = current.parentElement;
+                            }
+
+                            return el.parentElement
+                                ? el.parentElement.innerText
+                                : el.innerText;
+                        }
+                        """
+                    )
+
+            except Exception as exc:
+                print(
+                    f"Could not isolate product section: {exc}"
+                )
+
+            if not product_text:
+                product_text = body_text
+
+            product_text_clean = re.sub(
+                r"\s+",
+                " ",
+                product_text.replace("\xa0", " "),
+            ).strip()
+
+            product_text_lower = (
+                product_text_clean.lower()
+            )
+
+            print(
+                f"Product section length: "
+                f"{len(product_text_clean)} characters"
+            )
+
+            # -----------------------------------------------------
+            # Extract price again from the product section.
+            # This is preferred because it avoids prices from
+            # unrelated products.
+            # -----------------------------------------------------
+
+            section_price_patterns = [
+                r"MRP\s*[:\-]?\s*₹\s*([\d,]+)",
+                r"₹\s*([\d,]+)",
+            ]
+
+            for pattern in section_price_patterns:
+                match = re.search(
+                    pattern,
+                    product_text_clean,
+                    re.IGNORECASE,
+                )
+
+                if match:
+                    price = int(
+                        match.group(1).replace(",", "")
+                    )
+                    break
+
+            # -----------------------------------------------------
+            # Detect explicit unavailable state.
+            # -----------------------------------------------------
+
+            unavailable_phrases = [
+                "sold out",
+                "out of stock",
+            ]
+
+            unavailable = any(
+                phrase in product_text_lower
+                for phrase in unavailable_phrases
+            )
+
+            if unavailable:
+                return {
+                    "status": "OUT_OF_STOCK",
+                    "price": price,
+                    "pincode_applied": pincode_applied,
+                    "reason": (
+                        "Product section explicitly reports "
+                        "Sold Out / Out of Stock."
+                    ),
+                }
+
+            # -----------------------------------------------------
+            # Look for an enabled Add to Cart button.
+            # -----------------------------------------------------
+
+            add_to_cart = page.get_by_role(
+                "button",
+                name=re.compile(
+                    r"add\s*to\s*cart",
+                    re.IGNORECASE,
+                ),
+            )
+
+            add_to_cart_count = await add_to_cart.count()
+
+            print(
+                f"Add to Cart buttons found: "
+                f"{add_to_cart_count}"
+            )
+
+            for i in range(add_to_cart_count):
+                button = add_to_cart.nth(i)
+
+                try:
+                    if await button.is_visible():
+                        disabled = await button.is_disabled()
+
+                        print(
+                            f"Add to Cart button {i}: "
+                            f"visible=True, "
+                            f"disabled={disabled}"
+                        )
+
+                        if not disabled:
+                            return {
+                                "status": "IN_STOCK",
+                                "price": price,
+                                "pincode_applied": pincode_applied,
+                                "reason": (
+                                    "Enabled Add to Cart "
+                                    "button found."
+                                ),
+                            }
+
+                except Exception:
+                    continue
+
+            # -----------------------------------------------------
+            # Product exists but availability is ambiguous.
+            # Stay conservative.
+            # -----------------------------------------------------
 
             return {
                 "status": "UNKNOWN",
-                "price": None,
-                "pincode_applied": pincode_applied,
-                "reason": (
-                    "Product identity could not be reliably "
-                    "confirmed."
-                ),
-            }
-
-        # ---------------------------------------------------------
-        # Extract price.
-        # ---------------------------------------------------------
-
-        price = None
-
-        price_patterns = [
-            r"MRP\s*₹\s*([\d,]+)",
-            r"₹\s*([\d,]+)",
-        ]
-
-        for pattern in price_patterns:
-            match = re.search(
-                pattern,
-                body_text,
-                re.IGNORECASE,
-            )
-
-            if match:
-                price = int(
-                    match.group(1).replace(",", "")
-                )
-                break
-
-        # ---------------------------------------------------------
-        # Detect explicit unavailable state.
-        # ---------------------------------------------------------
-
-        unavailable_phrases = [
-            "sold out",
-            "out of stock",
-        ]
-
-        unavailable = any(
-            phrase in body_lower
-            for phrase in unavailable_phrases
-        )
-
-        if unavailable:
-            await browser.close()
-
-            return {
-                "status": "OUT_OF_STOCK",
                 "price": price,
                 "pincode_applied": pincode_applied,
                 "reason": (
-                    "Product page explicitly reports "
-                    "Sold Out / Out of Stock."
+                    "Product was found, but availability "
+                    "could not be confirmed."
                 ),
             }
 
-        # ---------------------------------------------------------
-        # Look for an enabled Add to Cart button.
-        # ---------------------------------------------------------
-
-        add_to_cart = page.get_by_role(
-            "button",
-            name=re.compile(
-                r"add to cart",
-                re.IGNORECASE,
-            ),
-        )
-
-        add_to_cart_count = await add_to_cart.count()
-
-        for i in range(add_to_cart_count):
-            button = add_to_cart.nth(i)
-
-            try:
-                if await button.is_visible():
-                    if not await button.is_disabled():
-                        await browser.close()
-
-                        return {
-                            "status": "IN_STOCK",
-                            "price": price,
-                            "pincode_applied": pincode_applied,
-                            "reason": (
-                                "Enabled Add to Cart button "
-                                "found."
-                            ),
-                        }
-
-            except Exception:
-                continue
-
-        # ---------------------------------------------------------
-        # If product is verified but we cannot determine whether
-        # it is purchasable, stay conservative.
-        # ---------------------------------------------------------
-
-        await browser.close()
-
-        return {
-            "status": "UNKNOWN",
-            "price": price,
-            "pincode_applied": pincode_applied,
-            "reason": (
-                "Product was found, but availability "
-                "could not be confirmed."
-            ),
-        }
+        finally:
+            await browser.close()
 
 
 async def main():
@@ -298,9 +448,11 @@ async def main():
     print(f"Product: {PRODUCT_NAME}")
     print(f"Pincode: {PINCODE}")
     print(f"Pincode applied: {pincode_applied}")
+
     print(
         f"Price: ₹{price if price is not None else 'unknown'}"
     )
+
     print(f"Status: {status}")
     print(f"Reason: {reason}")
 
@@ -311,7 +463,11 @@ async def main():
 
     save_state(status)
 
-    # Only notify when transitioning into stock.
+    # ---------------------------------------------------------
+    # Only send Telegram notification when the product becomes
+    # available.
+    # ---------------------------------------------------------
+
     if (
         status == "IN_STOCK"
         and previous_status in (
