@@ -2,401 +2,537 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime, timezone
+import sys
 
 import requests
 from playwright.async_api import async_playwright
 
 
-# ---------------------------------------------------------
+# ============================================================
 # CONFIGURATION
-# ---------------------------------------------------------
+# ============================================================
 
-SEARCH_URL = (
-    "https://shop.amul.com/en/search/high%20protein"
-)
+SEARCH_URL = "https://shop.amul.com/en/search/high%20protein"
 
-PRODUCT_NAME = (
-    "Amul High Protein Plain Lassi, 200 mL | Pack of 30"
-)
-
+PRODUCT_NAME = "Amul High Protein Plain Lassi, 200 mL | Pack of 30"
 PINCODE = "110044"
 
 STATE_FILE = "state.json"
 
-TELEGRAM_BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN"
-)
-
-TELEGRAM_CHAT_ID = os.environ.get(
-    "TELEGRAM_CHAT_ID"
-)
-
-PRODUCT_URL = (
-    "https://shop.amul.com/product/"
-    "amul-high-protein-plain-lassi-200-ml-or-pack-of-30"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# ---------------------------------------------------------
+# ============================================================
 # STATE
-# ---------------------------------------------------------
+# ============================================================
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"status": None}
+        return {}
 
     try:
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8",
-        ) as f:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-
     except Exception:
-        return {"status": None}
+        return {}
 
 
-def save_state(status):
-    with open(
-        STATE_FILE,
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(
-            {
-                "status": status,
-                "checked_at": (
-                    datetime.now(
-                        timezone.utc
-                    ).isoformat()
-                ),
-            },
-            f,
-            indent=2,
-        )
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
 
-# ---------------------------------------------------------
+# ============================================================
 # TELEGRAM
-# ---------------------------------------------------------
+# ============================================================
 
 def send_telegram(message):
-
-    if (
-        not TELEGRAM_BOT_TOKEN
-        or not TELEGRAM_CHAT_ID
-    ):
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN and "
-            "TELEGRAM_CHAT_ID must be configured."
-        )
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secrets are missing.")
+        return False
 
     url = (
         f"https://api.telegram.org/bot"
         f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
-    response = requests.post(
-        url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": False,
-        },
-        timeout=20,
-    )
+    try:
+        response = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+            },
+            timeout=20,
+        )
 
-    response.raise_for_status()
+        if response.ok:
+            print("Telegram alert sent.")
+            return True
+
+        print(
+            f"Telegram error: {response.status_code} "
+            f"{response.text[:300]}"
+        )
+        return False
+
+    except Exception as e:
+        print(f"Telegram request failed: {e}")
+        return False
 
 
-# ---------------------------------------------------------
+# ============================================================
 # PINCODE MODAL
-# ---------------------------------------------------------
+# ============================================================
 
-async def apply_pincode(page):
+async def find_pincode_input(page):
+    selectors = [
+        'input[placeholder*="ENTER YOUR PINCODE" i]',
+        'input[placeholder*="YOUR PINCODE" i]',
+        'input[placeholder*="PINCODE" i]',
+        'input[placeholder*="Pincode" i]',
+        'input[type="number"]',
+        'input[inputmode="numeric"]',
+    ]
 
-    print("Looking for delivery pincode dialog...")
+    for selector in selectors:
+        locator = page.locator(selector).first
+
+        try:
+            if await locator.count() > 0 and await locator.is_visible():
+                return locator
+        except Exception:
+            pass
+
+    return None
+
+
+async def pincode_modal_visible(page):
+    try:
+        title = page.get_by_text(
+            "Select Delivery Pincode",
+            exact=True
+        ).first
+
+        if await title.count() > 0:
+            return await title.is_visible()
+
+    except Exception:
+        pass
+
+    # Fallback: look for the pincode input itself.
+    try:
+        pincode_input = await find_pincode_input(page)
+        return pincode_input is not None
+    except Exception:
+        return False
+
+
+async def click_pincode_submit(page, pincode_input):
+    """
+    Amul's pincode popup has a magnifying-glass submit control
+    beside the input.
+
+    We try several methods because the site's HTML can change.
+    """
+
+    # --------------------------------------------------------
+    # Attempt 1: buttons close to the input
+    # --------------------------------------------------------
 
     try:
+        parent = pincode_input.locator("xpath=..")
 
-        # Wait briefly for the modal to appear.
-        await page.wait_for_timeout(2000)
+        buttons = parent.locator("button")
 
-        # Look for the modal.
-        modal_text = page.get_by_text(
-            "Select Delivery Pincode",
-            exact=True,
-        ).first
+        if await buttons.count() > 0:
+            for i in range(await buttons.count()):
+                button = buttons.nth(i)
 
-        modal_visible = False
+                try:
+                    if await button.is_visible():
+                        await button.click()
+                        print("Submitted pincode using nearby button.")
+                        return True
+                except Exception:
+                    pass
 
-        try:
-            modal_visible = await modal_text.is_visible()
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-        print(
-            f"Pincode dialog visible: "
-            f"{modal_visible}"
+    # --------------------------------------------------------
+    # Attempt 2: clickable elements in the input container
+    # --------------------------------------------------------
+
+    try:
+        parent = pincode_input.locator("xpath=..")
+
+        candidates = parent.locator(
+            "button, [role='button'], svg, "
+            "[onclick], a"
         )
 
-        # Find the actual pincode input.
-        pincode_input = page.locator(
-            'input[placeholder*="ENTER YOUR PINCODE" i]'
-        ).first
+        if await candidates.count() > 0:
+            for i in range(await candidates.count()):
+                candidate = candidates.nth(i)
 
-        if await pincode_input.count() == 0:
+                try:
+                    if await candidate.is_visible():
+                        await candidate.click(force=True)
+                        print(
+                            "Submitted pincode using nearby "
+                            "clickable element."
+                        )
+                        return True
+                except Exception:
+                    pass
 
-            pincode_input = page.locator(
-                'input[placeholder*="Pincode" i]'
-            ).first
+    except Exception:
+        pass
 
-        if await pincode_input.count() == 0:
+    # --------------------------------------------------------
+    # Attempt 3: click the right side of the input
+    #
+    # This matches the magnifying-glass UI shown by Amul.
+    # --------------------------------------------------------
+
+    try:
+        box = await pincode_input.bounding_box()
+
+        if box:
+            x = box["x"] + box["width"] - 18
+            y = box["y"] + box["height"] / 2
+
+            await page.mouse.click(x, y)
 
             print(
-                "Could not find the pincode input."
+                "Submitted pincode by clicking the "
+                "right side of the pincode field."
             )
 
-            return False
+            return True
 
-        print(
-            "Pincode input found."
+    except Exception as e:
+        print(f"Could not click pincode submit area: {e}")
+
+    return False
+
+
+async def apply_pincode(page):
+    print("Looking for delivery pincode dialog...")
+
+    # Give the popup a moment to appear.
+    try:
+        await page.get_by_text(
+            "Select Delivery Pincode",
+            exact=True
+        ).first.wait_for(
+            state="visible",
+            timeout=10000
         )
+    except Exception:
+        pass
 
-        # Fill pincode.
+    visible = await pincode_modal_visible(page)
+
+    print(f"Pincode dialog visible: {visible}")
+
+    if not visible:
+        print("Pincode dialog is not visible.")
+        return True
+
+    pincode_input = await find_pincode_input(page)
+
+    if pincode_input is None:
+        print("Could not find pincode input.")
+        return False
+
+    print("Pincode input found.")
+
+    try:
         await pincode_input.fill(PINCODE)
 
-        print(
-            f"Entered pincode: {PINCODE}"
-        )
+        print(f"Entered pincode: {PINCODE}")
 
-        # Submit using Enter.
+    except Exception as e:
+        print(f"Could not enter pincode: {e}")
+        return False
+
+    # First try Enter.
+    try:
         await pincode_input.press("Enter")
+        print("Pressed Enter on pincode field.")
+    except Exception:
+        pass
 
-        print(
-            "Submitted pincode with Enter."
-        )
+    # Give Amul time to process it.
+    await page.wait_for_timeout(2500)
 
-        # Give Amul time to process it.
-        await page.wait_for_timeout(4000)
-
-        # -------------------------------------------------
-        # Determine whether the dialog disappeared.
-        # -------------------------------------------------
-
-        try:
-
-            still_visible = await modal_text.is_visible()
-
-            print(
-                f"Pincode dialog still visible: "
-                f"{still_visible}"
-            )
-
-            if not still_visible:
-                print(
-                    "Pincode appears to have been accepted."
-                )
-
-                return True
-
-        except Exception:
-            pass
-
-        # -------------------------------------------------
-        # Sometimes the modal stays in the DOM but the
-        # input gets cleared/re-rendered.
-        # Check whether the input still contains our value.
-        # -------------------------------------------------
-
-        try:
-
-            current_value = (
-                await pincode_input.input_value()
-            )
-
-            print(
-                f"Pincode input after submission: "
-                f"{current_value}"
-            )
-
-            if PINCODE in current_value:
-                print(
-                    "Pincode value was retained."
-                )
-
-                return True
-
-        except Exception:
-            pass
-
-        print(
-            "Could not confirm pincode acceptance."
-        )
-
-        return False
-
-    except Exception as exc:
-
-        print(
-            f"Pincode handling error: {exc}"
-        )
-
-        return False
-
-
-# ---------------------------------------------------------
-# FIND PRODUCT CARD
-# ---------------------------------------------------------
-
-async def find_product_card(page):
+    # IMPORTANT:
+    # The old code incorrectly treated the pincode as applied
+    # just because the text remained in the field.
+    #
+    # We now require the popup to actually disappear.
+    visible = await pincode_modal_visible(page)
 
     print(
-        "Looking for exact lassi product..."
+        f"Pincode dialog visible after Enter: {visible}"
     )
 
-    # First try exact text.
-    product_locator = page.get_by_text(
-        PRODUCT_NAME,
-        exact=True,
-    ).first
+    if not visible:
+        print("Pincode applied successfully.")
+        return True
 
-    if await product_locator.count() == 0:
+    # Enter didn't close it, so click the magnifying-glass /
+    # submit control.
+    print(
+        "Pincode dialog is still open. "
+        "Clicking the submit/search control..."
+    )
 
-        # Fallback to partial product name.
-        product_locator = page.get_by_text(
+    await click_pincode_submit(page, pincode_input)
+
+    # Wait for Amul to process the pincode.
+    await page.wait_for_timeout(4000)
+
+    visible = await pincode_modal_visible(page)
+
+    print(
+        f"Pincode dialog visible after clicking submit: {visible}"
+    )
+
+    if not visible:
+        print("Pincode applied successfully.")
+        return True
+
+    # One final attempt: press Enter again.
+    try:
+        await pincode_input.press("Enter")
+        await page.wait_for_timeout(3000)
+    except Exception:
+        pass
+
+    visible = await pincode_modal_visible(page)
+
+    print(
+        f"Pincode dialog visible after final attempt: {visible}"
+    )
+
+    if not visible:
+        print("Pincode applied successfully.")
+        return True
+
+    print(
+        "ERROR: Amul's pincode dialog did not close."
+    )
+
+    return False
+
+
+# ============================================================
+# PRODUCT DETECTION
+# ============================================================
+
+def normalize_text(text):
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+async def find_product(page):
+    """
+    Find the exact lassi product in the search results.
+
+    We use several approaches because Amul's product-card HTML
+    can change.
+    """
+
+    target = normalize_text(PRODUCT_NAME)
+
+    # --------------------------------------------------------
+    # Method 1: exact visible text
+    # --------------------------------------------------------
+
+    try:
+        locator = page.get_by_text(
+            PRODUCT_NAME,
+            exact=True
+        ).first
+
+        if await locator.count() > 0 and await locator.is_visible():
+            print("Exact product text found.")
+            return locator
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # Method 2: partial text
+    # --------------------------------------------------------
+
+    try:
+        locator = page.get_by_text(
             re.compile(
-                r"Amul\s+High\s+Protein\s+Plain\s+Lassi",
-                re.IGNORECASE,
+                r"Amul High Protein Plain Lassi.*Pack of 30",
+                re.I
             )
         ).first
 
-    count = await product_locator.count()
+        if await locator.count() > 0 and await locator.is_visible():
+            print("Product found using partial text.")
+            return locator
 
-    print(
-        f"Matching product elements found: {count}"
-    )
+    except Exception:
+        pass
 
-    if count == 0:
+    # --------------------------------------------------------
+    # Method 3: scan text-bearing elements
+    # --------------------------------------------------------
+
+    try:
+        elements = page.locator(
+            "h1, h2, h3, h4, h5, h6, "
+            "a, div, span, p"
+        )
+
+        count = min(await elements.count(), 1000)
+
+        for i in range(count):
+            element = elements.nth(i)
+
+            try:
+                if not await element.is_visible():
+                    continue
+
+                text = normalize_text(
+                    await element.inner_text()
+                )
+
+                if (
+                    "amul high protein plain lassi" in text
+                    and "pack of 30" in text
+                ):
+                    print(
+                        "Product found by scanning page elements."
+                    )
+                    return element
+
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    return None
+
+
+async def get_product_card(product_element):
+    """
+    Walk upward from the product name and find a useful
+    product-card/container containing price and stock text.
+    """
+
+    if product_element is None:
         return None
 
     try:
-
-        # Walk upward through the DOM until we find the
-        # product-card container.
-        card_text = await product_locator.evaluate(
+        return await product_element.evaluate_handle(
             """
             (el) => {
-
                 let current = el;
 
-                for (let i = 0; i < 10; i++) {
-
-                    if (!current) {
-                        break;
-                    }
-
+                for (let i = 0; i < 8 && current; i++) {
                     const text =
-                        current.innerText || "";
-
-                    const lower =
-                        text.toLowerCase();
-
-                    const hasProduct =
-                        lower.includes(
-                            "amul high protein plain lassi"
-                        );
-
-                    const hasPack =
-                        lower.includes(
-                            "pack of 30"
-                        );
-
-                    const hasPrice =
-                        lower.includes(
-                            "mrp"
-                        );
-
-                    const hasAction =
-                        lower.includes(
-                            "add"
-                        )
-                        ||
-                        lower.includes(
-                            "notify me"
-                        )
-                        ||
-                        lower.includes(
-                            "sold out"
-                        );
+                        (current.innerText || '').toLowerCase();
 
                     if (
-                        hasProduct
-                        &&
-                        hasPack
-                        &&
-                        hasPrice
-                        &&
-                        hasAction
-                        &&
-                        text.length < 5000
+                        text.includes('pack of 30') &&
+                        (
+                            text.includes('₹') ||
+                            text.includes('sold out') ||
+                            text.includes('notify me') ||
+                            text.includes('add to cart') ||
+                            text.includes('out of stock')
+                        )
                     ) {
-                        return text;
+                        return current;
                     }
 
-                    current =
-                        current.parentElement;
+                    current = current.parentElement;
                 }
 
-                return el.innerText || "";
+                return el;
             }
             """
         )
 
-        return card_text
-
-    except Exception as exc:
-
-        print(
-            f"Could not extract product card: "
-            f"{exc}"
-        )
-
+    except Exception:
         return None
 
 
-# ---------------------------------------------------------
+# ============================================================
+# STOCK STATUS
+# ============================================================
+
+def extract_price(text):
+    patterns = [
+        r"₹\s*[\d,]+(?:\.\d+)?",
+        r"Rs\.?\s*[\d,]+(?:\.\d+)?",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+
+        if match:
+            return match.group(0).strip()
+
+    return "₹unknown"
+
+
+def detect_status(text):
+    lower = normalize_text(text)
+
+    # Sold-out checks first.
+    if (
+        "sold out" in lower
+        or "out of stock" in lower
+        or "notify me" in lower
+    ):
+        return "OUT_OF_STOCK"
+
+    # Positive availability checks.
+    if (
+        "add to cart" in lower
+        or "buy now" in lower
+        or "in stock" in lower
+    ):
+        return "IN_STOCK"
+
+    return "UNKNOWN"
+
+
+# ============================================================
 # STOCK CHECK
-# ---------------------------------------------------------
+# ============================================================
 
 async def check_stock():
-
     async with async_playwright() as p:
 
         browser = await p.chromium.launch(
             headless=True
         )
 
-        page = await browser.new_page(
+        context = await browser.new_context(
             viewport={
-                "width": 1440,
-                "height": 1000,
+                "width": 1365,
+                "height": 900,
             },
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            locale="en-IN",
         )
 
-        try:
+        page = await context.new_page()
 
-            print(
-                f"Opening search page: {SEARCH_URL}"
-            )
+        try:
+            print(f"Opening search page: {SEARCH_URL}")
 
             await page.goto(
                 SEARCH_URL,
@@ -404,318 +540,198 @@ async def check_stock():
                 timeout=60000,
             )
 
-            # Allow storefront JavaScript to render.
-            await page.wait_for_timeout(7000)
+            print(f"Initial URL: {page.url}")
 
-            print(
-                f"Initial URL: {page.url}"
-            )
+            # Let the site finish rendering.
+            await page.wait_for_timeout(3000)
 
-            # -------------------------------------------------
+            # ------------------------------------------------
             # Apply delivery pincode.
-            # -------------------------------------------------
+            # ------------------------------------------------
 
-            pincode_applied = (
-                await apply_pincode(page)
-            )
-
-            # Allow results to refresh after pincode.
-            await page.wait_for_timeout(4000)
+            pincode_applied = await apply_pincode(page)
 
             print(
-                f"Pincode applied: "
-                f"{pincode_applied}"
+                f"Pincode applied: {pincode_applied}"
             )
 
-            print(
-                f"URL after pincode: "
-                f"{page.url}"
-            )
+            if not pincode_applied:
+                return {
+                    "status": "UNKNOWN",
+                    "price": "₹unknown",
+                    "reason": "Could not apply delivery pincode.",
+                }
 
-            # -------------------------------------------------
-            # Read whole page for diagnostics.
-            # -------------------------------------------------
+            print(f"URL after pincode: {page.url}")
 
-            body_text = await page.locator(
-                "body"
-            ).inner_text()
+            # ------------------------------------------------
+            # Wait for search results.
+            # ------------------------------------------------
 
-            print(
-                f"Page text length: "
-                f"{len(body_text)} characters"
-            )
+            await page.wait_for_timeout(3000)
 
-            # -------------------------------------------------
-            # Find exact product card.
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # Find product.
+            # ------------------------------------------------
 
-            card_text = (
-                await find_product_card(page)
-            )
+            print("Looking for exact lassi product...")
 
-            if not card_text:
+            product = await find_product(page)
+
+            if product is None:
+
+                # Save useful diagnostic information in logs.
+                body_text = await page.locator(
+                    "body"
+                ).inner_text()
+
+                print(
+                    f"Page text length: {len(body_text)} characters"
+                )
+
+                print(
+                    "Matching product elements found: 0"
+                )
 
                 return {
                     "status": "UNKNOWN",
-                    "price": None,
-                    "pincode_applied": (
-                        pincode_applied
-                    ),
+                    "price": "₹unknown",
                     "reason": (
-                        "Exact Amul lassi product "
-                        "could not be found in "
-                        "search results."
+                        "Exact Amul lassi product could not "
+                        "be found in search results."
                     ),
                 }
 
-            # Normalize whitespace.
-            card_text = re.sub(
-                r"\s+",
-                " ",
-                card_text.replace(
-                    "\xa0",
-                    " ",
-                ),
-            ).strip()
+            print("Product found.")
 
-            card_lower = card_text.lower()
+            # ------------------------------------------------
+            # Get surrounding product card.
+            # ------------------------------------------------
 
-            print(
-                "Product card:"
-            )
+            card = await get_product_card(product)
 
-            print(
-                card_text[:1500]
-            )
-
-            # -------------------------------------------------
-            # Extract price.
-            # -------------------------------------------------
-
-            price = None
-
-            price_patterns = [
-                r"MRP\s*[:\-]?\s*₹\s*([\d,]+)",
-                r"₹\s*([\d,]+)",
-            ]
-
-            for pattern in price_patterns:
-
-                match = re.search(
-                    pattern,
-                    card_text,
-                    re.IGNORECASE,
-                )
-
-                if match:
-
-                    price = int(
-                        match.group(1)
-                        .replace(",", "")
+            if card is not None:
+                try:
+                    card_text = await card.evaluate(
+                        "(el) => el.innerText || ''"
                     )
+                except Exception:
+                    card_text = await product.inner_text()
+            else:
+                card_text = await product.inner_text()
 
-                    break
+            # If card text is too small, use page text as a
+            # fallback.
+            if len(card_text.strip()) < 30:
+                card_text = await page.locator(
+                    "body"
+                ).inner_text()
 
-            # -------------------------------------------------
-            # Detect stock status.
-            # -------------------------------------------------
+            print("Product information:")
+            print(card_text[:1500])
 
-            sold_out = (
-                "sold out" in card_lower
-            )
+            # ------------------------------------------------
+            # Extract price and status.
+            # ------------------------------------------------
 
-            out_of_stock = (
-                "out of stock" in card_lower
-            )
+            price = extract_price(card_text)
+            status = detect_status(card_text)
 
-            notify_me = (
-                "notify me" in card_lower
-            )
+            return {
+                "status": status,
+                "price": price,
+                "reason": "Product found and checked.",
+            }
 
-            add_button = (
-                re.search(
-                    r"\badd\b",
-                    card_lower,
-                )
-                is not None
-            )
-
-            print(
-                f"Sold Out: {sold_out}"
-            )
-
-            print(
-                f"Out of Stock: {out_of_stock}"
-            )
+        except Exception as e:
 
             print(
-                f"Notify Me: {notify_me}"
+                f"Stock check failed with exception: {e}"
             )
-
-            print(
-                f"ADD detected: {add_button}"
-            )
-
-            # -------------------------------------------------
-            # OUT OF STOCK
-            # -------------------------------------------------
-
-            if (
-                sold_out
-                or out_of_stock
-                or notify_me
-            ):
-
-                return {
-                    "status": "OUT_OF_STOCK",
-                    "price": price,
-                    "pincode_applied": (
-                        pincode_applied
-                    ),
-                    "reason": (
-                        "Product card shows "
-                        "Sold Out / Notify Me."
-                    ),
-                }
-
-            # -------------------------------------------------
-            # IN STOCK
-            # -------------------------------------------------
-
-            if add_button:
-
-                return {
-                    "status": "IN_STOCK",
-                    "price": price,
-                    "pincode_applied": (
-                        pincode_applied
-                    ),
-                    "reason": (
-                        "Product card shows "
-                        "ADD."
-                    ),
-                }
-
-            # -------------------------------------------------
-            # UNKNOWN
-            # -------------------------------------------------
 
             return {
                 "status": "UNKNOWN",
-                "price": price,
-                "pincode_applied": (
-                    pincode_applied
-                ),
-                "reason": (
-                    "Product was found, but "
-                    "availability could not "
-                    "be determined."
-                ),
+                "price": "₹unknown",
+                "reason": f"Exception: {e}",
             }
 
         finally:
-
             await browser.close()
 
 
-# ---------------------------------------------------------
+# ============================================================
 # MAIN
-# ---------------------------------------------------------
+# ============================================================
 
 async def main():
 
-    print("=" * 60)
-    print("Amul Stock Watcher")
-    print("=" * 60)
+    if len(sys.argv) < 2 or sys.argv[1].lower() != "check":
+        print(
+            "Usage: python amul_stock_watcher.py check"
+        )
+        return
+
+    state = load_state()
+
+    previous_status = state.get("status")
+
+    print(
+        f"Previous status: {previous_status}"
+    )
 
     result = await check_stock()
 
     status = result["status"]
     price = result["price"]
-    pincode_applied = result[
-        "pincode_applied"
-    ]
     reason = result["reason"]
 
-    print(
-        f"Product: {PRODUCT_NAME}"
-    )
+    print("----------------------------------------")
+    print(f"Product: {PRODUCT_NAME}")
+    print(f"Pincode: {PINCODE}")
+    print(f"Price: {price}")
+    print(f"Status: {status}")
+    print(f"Reason: {reason}")
+    print(f"Previous status: {previous_status}")
+    print("----------------------------------------")
 
-    print(
-        f"Pincode: {PINCODE}"
-    )
-
-    print(
-        f"Pincode applied: "
-        f"{pincode_applied}"
-    )
-
-    print(
-        f"Price: ₹"
-        f"{price if price is not None else 'unknown'}"
-    )
-
-    print(
-        f"Status: {status}"
-    )
-
-    print(
-        f"Reason: {reason}"
-    )
-
-    # -----------------------------------------------------
-    # Previous state
-    # -----------------------------------------------------
-
-    previous_state = load_state()
-
-    previous_status = (
-        previous_state.get("status")
-    )
-
-    print(
-        f"Previous status: "
-        f"{previous_status}"
-    )
-
-    save_state(status)
-
-    # -----------------------------------------------------
-    # Telegram alert ONLY when becoming available.
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Alert only when the product becomes available.
+    # --------------------------------------------------------
 
     if (
         status == "IN_STOCK"
-        and previous_status in (
-            "OUT_OF_STOCK",
-            "UNKNOWN",
-            None,
-        )
+        and previous_status != "IN_STOCK"
     ):
 
         message = (
-            "🚨 AMUL LASSI IS BACK IN STOCK!\n\n"
-            f"{PRODUCT_NAME}\n"
-            f"Price: ₹"
-            f"{price if price is not None else 'Unknown'}\n"
-            f"Delivery pincode: {PINCODE}\n\n"
-            f"🛒 Buy now:\n"
-            f"{PRODUCT_URL}"
+            "🚨 AMUL STOCK ALERT 🚨\n\n"
+            f"{PRODUCT_NAME}\n\n"
+            f"Price: {price}\n"
+            f"Status: IN STOCK ✅\n"
+            f"Delivery Pincode: {PINCODE}\n\n"
+            "Check Amul now."
         )
 
         send_telegram(message)
 
-        print(
-            "✅ Telegram stock alert sent!"
-        )
-
     else:
+        print("No Telegram alert needed.")
 
-        print(
-            "No Telegram alert needed."
-        )
+    # --------------------------------------------------------
+    # Save current state.
+    # --------------------------------------------------------
 
-    print("=" * 60)
+    state = {
+        "status": status,
+        "price": price,
+        "product": PRODUCT_NAME,
+        "pincode": PINCODE,
+        "reason": reason,
+    }
+
+    save_state(state)
+
+    print("State saved.")
 
 
 if __name__ == "__main__":
